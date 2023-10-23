@@ -17,11 +17,18 @@
 package trie
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 )
+
+var storageOldestNodeKey = []byte{0, 1, 2}
+var storageNewestNodeKey = []byte{0, 2, 4}
 
 // SecureTrie is the old name of StateTrie.
 // Deprecated: use StateTrie.
@@ -54,6 +61,8 @@ type StateTrie struct {
 	hashKeyBuf       [common.HashLength]byte
 	secKeyCache      map[string][]byte
 	secKeyCacheOwner *StateTrie // Pointer to self, replace the key cache on mismatch
+	newestNodeKey    common.Address
+	oldestNodeKey    common.Address
 }
 
 // NewStateTrie creates a trie with an existing root node from a backing database.
@@ -69,7 +78,48 @@ func NewStateTrie(id *ID, db *Database) (*StateTrie, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &StateTrie{trie: *trie, preimages: db.preimages}, nil
+
+	newest, err1 := db.diskdb.Get(storageNewestNodeKey)
+	oldest, err2 := db.diskdb.Get(storageOldestNodeKey)
+
+	var newest_acc common.Address
+	if err1 == nil {
+		newest_acc = common.BytesToAddress(newest)
+	} else {
+		newest_acc = common.BytesToAddress(common.CopyBytes(types.ADDRESS_NULL[:]))
+	}
+
+	var oldest_acc common.Address
+	if err2 == nil {
+		oldest_acc = common.BytesToAddress(oldest)
+	} else {
+		oldest_acc = common.BytesToAddress(common.CopyBytes(types.ADDRESS_NULL[:]))
+	}
+
+	return &StateTrie{
+		trie:          *trie,
+		preimages:     db.preimages,
+		newestNodeKey: newest_acc,
+		oldestNodeKey: oldest_acc,
+	}, nil
+}
+
+func (t *StateTrie) SaveLinkedData(db *Database) error {
+	if !bytes.Equal(types.ADDRESS_NULL[:], t.newestNodeKey[:]) {
+		err := db.diskdb.Put(storageNewestNodeKey, t.newestNodeKey[:])
+		if err != nil {
+			return err
+		}
+	}
+
+	if !bytes.Equal(types.ADDRESS_NULL[:], t.oldestNodeKey[:]) {
+		err := db.diskdb.Put(storageOldestNodeKey, t.oldestNodeKey[:])
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // MustGet returns the value for key stored in the trie.
@@ -164,6 +214,20 @@ func (t *StateTrie) UpdateStorage(_ common.Address, key, value []byte) error {
 
 // UpdateAccount will abstract the write of an account to the secure trie.
 func (t *StateTrie) UpdateAccount(address common.Address, acc *types.StateAccount) error {
+	hk := t.hashKey(address.Bytes())
+	data, err := rlp.EncodeToBytes(acc)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Update Called for ", address)
+	if err := t.trie.Update(hk, data); err != nil {
+		return err
+	}
+	t.getSecKeyCache()[string(hk)] = address.Bytes()
+	return t.putLinkedAccounts(address, acc)
+}
+
+func (t *StateTrie) updateAccount2(address common.Address, acc *types.StateAccount) error {
 	hk := t.hashKey(address.Bytes())
 	data, err := rlp.EncodeToBytes(acc)
 	if err != nil {
@@ -287,4 +351,114 @@ func (t *StateTrie) getSecKeyCache() map[string][]byte {
 		t.secKeyCache = make(map[string][]byte)
 	}
 	return t.secKeyCache
+}
+
+var notInTrie = errors.New("the node is not in trie")
+
+func (t *StateTrie) putLinkedAccounts(address common.Address, acc *types.StateAccount) error {
+	n0, err0 := t.GetAccount(address)
+	fmt.Println("Im Here : ", n0)
+	if !bytes.Equal(types.ADDRESS_NULL[:], acc.Next[:]) {
+		n, err := t.GetAccount(acc.Next)
+		if n == nil {
+			fmt.Println(err, "Next")
+			return err
+		}
+	}
+	if !bytes.Equal(types.ADDRESS_NULL[:], acc.Prev[:]) {
+		n, err := t.GetAccount(acc.Prev)
+		if n == nil {
+			fmt.Println(err, "Prev")
+			return err
+		}
+	}
+	if n0 != nil && err0 == nil {
+		if bytes.Equal(types.ADDRESS_NULL[:], acc.Next[:]) {
+			acc.Next = common.BytesToAddress(common.CopyBytes(t.newestNodeKey[:]))
+		}
+		fmt.Println(acc.Prev, " <--------w ", address, " --------> ", acc.Next)
+		err := t.updateLinkedAccounts(acc)
+		if err != nil && err != notInTrie {
+			return err
+		}
+	}
+	if n0 == nil {
+		fmt.Println(err0, address)
+		return err0
+	}
+	nextAddress := acc.Next
+	// acc.LastModified = getBlockNumber()
+	acc.Next = common.BytesToAddress(common.CopyBytes(types.ADDRESS_NULL[:]))
+	if !bytes.Equal(address[:], t.newestNodeKey[:]) {
+		acc.Prev = common.BytesToAddress(common.CopyBytes(t.newestNodeKey[:]))
+	}
+
+	if bytes.Equal(types.ADDRESS_NULL[:], t.newestNodeKey[:]) {
+		t.newestNodeKey = common.BytesToAddress(common.CopyBytes(address[:]))
+	} else if !bytes.Equal(types.ADDRESS_NULL[:], t.newestNodeKey[:]) && !bytes.Equal(t.newestNodeKey[:], address[:]) {
+		newestNode, err := t.GetAccount(t.newestNodeKey)
+		if err != nil {
+			return err
+		}
+		if newestNode != nil {
+			newestNode.Next = common.BytesToAddress(common.CopyBytes(address[:]))
+			data, err := rlp.EncodeToBytes(newestNode)
+			if err != nil {
+				return err
+			}
+			t.MustUpdate(common.CopyBytes(t.newestNodeKey[:]), data)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	if bytes.Equal(types.ADDRESS_NULL[:], t.oldestNodeKey[:]) {
+		t.oldestNodeKey = common.BytesToAddress(common.CopyBytes(address[:]))
+
+	} else if bytes.Equal(t.oldestNodeKey[:], address[:]) {
+		nextOldestNode := nextAddress
+		if !bytes.Equal(types.ADDRESS_NULL[:], nextOldestNode[:]) {
+			t.oldestNodeKey = common.BytesToAddress(common.CopyBytes(nextOldestNode[:]))
+		}
+	}
+
+	t.newestNodeKey = common.BytesToAddress(common.CopyBytes(address[:]))
+	fmt.Println("NEWEST NODE KEY UPDATED TO ", address)
+	return nil
+}
+
+func (t *StateTrie) updateLinkedAccounts(acc *types.StateAccount) error {
+	if !bytes.Equal(types.ADDRESS_NULL[:], acc.Prev[:]) {
+		prevAddress := acc.Prev
+		prevAccount, err := t.GetAccount(prevAddress)
+		if err != nil {
+			return err
+		}
+		if prevAccount == nil {
+			return notInTrie
+		}
+		prevAccount.Next = common.BytesToAddress(common.CopyBytes(acc.Next[:]))
+		err = t.updateAccount2(prevAddress, prevAccount)
+		if err != nil {
+			return err
+		}
+	}
+
+	if !bytes.Equal(types.ADDRESS_NULL[:], acc.Next[:]) {
+		nextAddress := acc.Next
+		nextAccount, err := t.GetAccount(nextAddress)
+		if err != nil {
+			return err
+		}
+		if nextAccount == nil {
+			return notInTrie
+		}
+		nextAccount.Prev = common.BytesToAddress(common.CopyBytes(acc.Prev[:]))
+		err = t.updateAccount2(nextAddress, nextAccount)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

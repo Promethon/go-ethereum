@@ -26,11 +26,15 @@ import (
 
 //go:generate go run ../../rlp/rlpgen -type StateAccount -out gen_account_rlp.go
 
+var ADDRESS_NULL = common.Address{}
+
 // StateAccount is the Ethereum consensus representation of accounts.
 // These objects are stored in the main account trie.
 type StateAccount struct {
 	Nonce    uint64
 	Balance  *big.Int
+	Next     common.Address
+	Prev     common.Address
 	Root     common.Hash // merkle root of the storage trie
 	CodeHash []byte
 }
@@ -41,6 +45,8 @@ func NewEmptyStateAccount() *StateAccount {
 		Balance:  new(big.Int),
 		Root:     EmptyRootHash,
 		CodeHash: EmptyCodeHash.Bytes(),
+		Prev:     ADDRESS_NULL,
+		Next:     ADDRESS_NULL,
 	}
 }
 
@@ -55,6 +61,8 @@ func (acct *StateAccount) Copy() *StateAccount {
 		Balance:  balance,
 		Root:     acct.Root,
 		CodeHash: common.CopyBytes(acct.CodeHash),
+		Next:     acct.Next,
+		Prev:     acct.Prev,
 	}
 }
 
@@ -64,6 +72,8 @@ func (acct *StateAccount) Copy() *StateAccount {
 type SlimAccount struct {
 	Nonce    uint64
 	Balance  *big.Int
+	Next     common.Address
+	Prev     common.Address
 	Root     []byte // Nil if root equals to types.EmptyRootHash
 	CodeHash []byte // Nil if hash equals to types.EmptyCodeHash
 }
@@ -73,6 +83,8 @@ func SlimAccountRLP(account StateAccount) []byte {
 	slim := SlimAccount{
 		Nonce:   account.Nonce,
 		Balance: account.Balance,
+		Next:    account.Next,
+		Prev:    account.Prev,
 	}
 	if account.Root != EmptyRootHash {
 		slim.Root = account.Root[:]
@@ -87,7 +99,7 @@ func SlimAccountRLP(account StateAccount) []byte {
 	return data
 }
 
-// FullAccount decodes the data on the 'slim RLP' format and return
+// FullAccount decodes the data on the 'slim RLP' format and returns
 // the consensus format account.
 func FullAccount(data []byte) (*StateAccount, error) {
 	var slim SlimAccount
